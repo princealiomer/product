@@ -143,10 +143,28 @@ class ProductHuntScraper:
             if name_el:
                 data['product_name'] = name_el.text.strip()
         
+        
         if not data['website_url']:
-            website_link = soup.find('a', {'data-test': 'visit-website-button'})
-            if website_link:
-                data['website_url'] = website_link.get('href', '')
+            # Try multiple selectors for website link
+            selectors = [
+                ('a', {'data-test': 'visit-website-button'}),
+                ('a', {'class': 'styles_websiteLink__zSEaT'}),
+                ('a', lambda tag: tag.get('href', '').startswith('http') and 
+                                 ('Visit' in tag.text or 'Website' in tag.text or 'Get' in tag.text))
+            ]
+            
+            for selector in selectors:
+                if isinstance(selector[1], dict):
+                    website_link = soup.find(selector[0], selector[1])
+                else:
+                    website_link = soup.find(selector[0], selector[1])
+                
+                if website_link:
+                    href = website_link.get('href', '')
+                    # Filter out producthunt.com links
+                    if href and 'producthunt.com' not in href:
+                        data['website_url'] = href
+                        break
 
         if not data['tagline']:
             for tag in ['h2.text-18', 'h2.font-medium', 'h2']:
