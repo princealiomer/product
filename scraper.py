@@ -44,7 +44,9 @@ class ProductHuntScraper:
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
-                    '--disable-gpu'
+                    '--disable-gpu',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-features=IsolateOrigins,site-per-process'
                 ]
             )
         except Exception as e:
@@ -56,9 +58,24 @@ class ProductHuntScraper:
             )
 
         self.context = self.browser.new_context(
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            viewport={'width': 1920, 'height': 1080}
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080},
+            locale='en-US',
+            timezone_id='America/New_York',
+            extra_http_headers={
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Referer': 'https://www.google.com/'
+            }
         )
+        
+        # Add stealth scripts to avoid detection
+        self.context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {
+                get: () => undefined
+            });
+        """)
 
     def stop(self):
         """Closes the browser session."""
@@ -92,6 +109,33 @@ class ProductHuntScraper:
         try:
             # Reduced timeout to fail faster on bad pages
             page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            
+            # Check for Cloudflare challenge
+            cloudflare_detected = False
+            try:
+                # Check for Cloudflare challenge page
+                cf_challenge = page.locator('text=/checking your browser|cloudflare|security check/i')
+                if cf_challenge.count() > 0:
+                    cloudflare_detected = True
+                    print(f"⚠️ Cloudflare challenge detected, waiting up to 30s for completion...")
+                    
+                    # Wait for challenge to complete (challenge page disappears)
+                    max_wait = 30
+                    waited = 0
+                    while waited < max_wait:
+                        time.sleep(2)
+                        waited += 2
+                        # Check if we're past the challenge
+                        if cf_challenge.count() == 0:
+                            print(f"✓ Cloudflare challenge passed after {waited}s")
+                            break
+                    
+                    if waited >= max_wait:
+                        print(f"❌ Cloudflare challenge timeout after {max_wait}s")
+                        data['error'] = 'Cloudflare challenge timeout'
+                        return data
+            except:
+                pass  # No challenge detected
             
             # Fast check for content
             try:
