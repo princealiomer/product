@@ -69,12 +69,13 @@ class ProductHuntScraper:
         if self.playwright:
             self.playwright.stop()
 
-    def scrape_url(self, url):
-        """Scrapes a single URL using the active browser context."""
+    def scrape_url(self, url, retry_count=0, max_retries=2):
+        """Scrapes a single URL using the active browser context with automatic retry."""
         if not self.context:
             raise RuntimeError("Browser not started. Use 'with ProductHuntScraper() as scraper:' or call scraper.start() first.")
 
-        print(f"Scraping: {url}")
+        retry_suffix = f" (Retry {retry_count}/{max_retries})" if retry_count > 0 else ""
+        print(f"Scraping: {url}{retry_suffix}")
         page = self.context.new_page()
         
         data = {
@@ -102,10 +103,24 @@ class ProductHuntScraper:
             soup = BeautifulSoup(content, 'html.parser')
             
             self._parse_content(soup, data)
+            
+            # Check if scrape was successful (got at least product name)
+            if not data['product_name'] and retry_count < max_retries:
+                print(f"⚠️ Incomplete data extracted, retrying...")
+                page.close()
+                time.sleep(2 ** retry_count)  # Exponential backoff: 1s, 2s, 4s
+                return self.scrape_url(url, retry_count + 1, max_retries)
 
         except Exception as e:
-            print(f"Error scraping {url}: {e}")
+            print(f"❌ Error scraping {url}: {e}")
             data['error'] = str(e)
+            
+            # Retry on error
+            if retry_count < max_retries:
+                print(f"⚠️ Retrying after error...")
+                page.close()
+                time.sleep(2 ** retry_count)  # Exponential backoff
+                return self.scrape_url(url, retry_count + 1, max_retries)
         finally:
             page.close()
             
@@ -149,22 +164,28 @@ class ProductHuntScraper:
             selectors = [
                 ('a', {'data-test': 'visit-website-button'}),
                 ('a', {'class': 'styles_websiteLink__zSEaT'}),
-                ('a', lambda tag: tag.get('href', '').startswith('http') and 
-                                 ('Visit' in tag.text or 'Website' in tag.text or 'Get' in tag.text))
+                ('a', lambda tag: (tag and tag.get('href', '') and 
+                                  tag.get('href', '').startswith('http') and 
+                                  tag.text and 
+                                  ('Visit' in tag.text or 'Website' in tag.text or 'Get' in tag.text)))
             ]
             
             for selector in selectors:
-                if isinstance(selector[1], dict):
-                    website_link = soup.find(selector[0], selector[1])
-                else:
-                    website_link = soup.find(selector[0], selector[1])
-                
-                if website_link:
-                    href = website_link.get('href', '')
-                    # Filter out producthunt.com links
-                    if href and 'producthunt.com' not in href:
-                        data['website_url'] = href
-                        break
+                try:
+                    if isinstance(selector[1], dict):
+                        website_link = soup.find(selector[0], selector[1])
+                    else:
+                        website_link = soup.find(selector[0], selector[1])
+                    
+                    if website_link:
+                        href = website_link.get('href', '')
+                        # Filter out producthunt.com links
+                        if href and 'producthunt.com' not in href:
+                            data['website_url'] = href
+                            break
+                except Exception as e:
+                    # Skip this selector if it fails
+                    continue
 
         if not data['tagline']:
             for tag in ['h2.text-18', 'h2.font-medium', 'h2']:
