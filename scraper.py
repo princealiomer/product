@@ -5,182 +5,279 @@ import time
 import os
 import random
 import json
+import subprocess
 
 def install_playwright_browser():
     """
     Installs Playwright Chromium browser if not already present.
-    Useful for environments like Streamlit Cloud where we can't easily run shell commands pre-startup.
     """
-    import subprocess
     print("Checking/Installing Playwright Chromium...")
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
-        # Also install deps if possible (may fail if no sudo, but worth a shot or relying on packages.txt)
-        # subprocess.run(["playwright", "install-deps", "chromium"], check=True) 
         print("Playwright installation check complete.")
     except Exception as e:
         print(f"Error installing Playwright: {e}")
 
-def scrape_producthunt_with_playwright(url):
-    print(f"Scraping: {url}")
-    
-    # Ensure browser is installed before first launch
-    # We do this here or could do it at module level, but inside function is safer for imports
-    install_playwright_browser()
-    
-    with sync_playwright() as p:
+class ProductHuntScraper:
+    def __init__(self, headless=True):
+        self.headless = headless
+        self.playwright = None
+        self.browser = None
+        self.context = None
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
+    def start(self):
+        """Starts the Playwright browser session."""
+        install_playwright_browser()
+        self.playwright = sync_playwright().start()
+        
         try:
-            # Try to launch with fallback args for containerized envs
-            browser = p.chromium.launch(
-                headless=True,
+            self.browser = self.playwright.chromium.launch(
+                headless=self.headless,
                 args=[
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
-                    '--disable-gpu' # Often needed in headless linux
+                    '--disable-gpu'
                 ]
             )
         except Exception as e:
-            # Last ditch effort: try installing and launching again if specifically a missing executable error
             print(f"Launch failed, retrying after install: {e}")
             install_playwright_browser()
-            browser = p.chromium.launch(
-                headless=True,
+            self.browser = self.playwright.chromium.launch(
+                headless=self.headless,
                 args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
             )
 
-        # Use a consistent, real user agent
-        context = browser.new_context(
+        self.context = self.browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             viewport={'width': 1920, 'height': 1080}
         )
+
+    def stop(self):
+        """Closes the browser session."""
+        if self.context:
+            self.context.close()
+        if self.browser:
+            self.browser.close()
+        if self.playwright:
+            self.playwright.stop()
+
+    def scrape_url(self, url):
+        """Scrapes a single URL using the active browser context."""
+        if not self.context:
+            raise RuntimeError("Browser not started. Use 'with ProductHuntScraper() as scraper:' or call scraper.start() first.")
+
+        print(f"Scraping: {url}")
+        page = self.context.new_page()
         
-        page = context.new_page()
-        
+        data = {
+            'url': url,
+            'product_name': '',
+            'website_url': '',
+            'tagline': '',
+            'rating': '',
+            'reviews_count': '',
+            'categories': '',
+            'error': ''
+        }
+
         try:
-            # Go to page with extended timeout
-            page.goto(url, timeout=60000, wait_until="domcontentloaded")
+            # Reduced timeout to fail faster on bad pages
+            page.goto(url, timeout=30000, wait_until="domcontentloaded")
             
-            # Wait for specific element to ensure page loaded (e.g. product name header)
-            # This implicitly waits for Cloudflare to pass
+            # Fast check for content
             try:
-                page.wait_for_selector('h1', timeout=30000)
+                page.wait_for_selector('h1', timeout=10000)
             except:
-                print("Timeout waiting for content, page might be blocked or slow.")
-            
-            # Get the full HTML content after JS execution
+                print(f"Warning: Timeout waiting for h1 on {url}")
+
             content = page.content()
             soup = BeautifulSoup(content, 'html.parser')
             
-            data = {
-                'url': url,
-                'product_name': '',
-                'website_url': '',
-                'tagline': '',
-                'rating': '',
-                'reviews_count': '',
-                'categories': ''
-            }
-            
-            # 1. Try JSON-LD first (Structured Data)
-            json_ld = soup.find('script', type='application/ld+json')
-            if json_ld:
-                try:
-                    data_json = json.loads(json_ld.string)
-                    if isinstance(data_json, list):
-                        for item in data_json:
-                            if item.get('@type') in ['Product', 'WebApplication', ['WebApplication', 'Product']]:
-                                    data_json = item
-                                    break
-                    
-                    if data_json.get('name'):
-                        data['product_name'] = data_json['name']
-                    
-                    if data_json.get('aggregateRating'):
-                        rating_obj = data_json['aggregateRating']
-                        if rating_obj.get('ratingValue'):
-                            data['rating'] = str(rating_obj['ratingValue'])
-                        if rating_obj.get('ratingCount'):
-                            data['reviews_count'] = str(rating_obj['ratingCount'])
-                    
-                    if data_json.get('applicationCategory'):
-                        data['categories'] = data_json['applicationCategory']
-                        
-                except Exception as e:
-                    print(f"Error parsing JSON-LD: {e}")
+            self._parse_content(soup, data)
 
-            # 2. HTML Fallbacks / Refinements
-            
-            # Product Name
-            if not data['product_name']:
-                name_el = soup.find('h1')
-                if name_el:
-                    data['product_name'] = name_el.text.strip()
-            
-            # Website URL
-            if not data['website_url']:
-                website_link = soup.find('a', {'data-test': 'visit-website-button'})
-                if website_link:
-                    data['website_url'] = website_link.get('href', '')
-
-            # Tagline
-            if not data['tagline']:
-                tagline_el = soup.find('h2', class_='text-18')
-                if not tagline_el:
-                    tagline_el = soup.find('h2', class_='font-medium')
-                if not tagline_el:
-                    tagline_el = soup.find('h2')
-                
-                if tagline_el:
-                    data['tagline'] = tagline_el.text.strip()
-
-            # Rating
-            if not data['rating']:
-                rating_spans = soup.find_all('span', class_='text-14 font-medium')
-                for span in rating_spans:
-                    text = span.text.strip()
-                    try:
-                        val = float(text)
-                        if 0 <= val <= 5:
-                            data['rating'] = text
-                            break
-                    except ValueError:
-                        continue
-
-            # Reviews Count
-            if not data['reviews_count']:
-                reviews_link = soup.find('a', href=lambda x: x and '/reviews' in x)
-                if reviews_link and 'review' in reviews_link.text.lower():
-                        data['reviews_count'] = reviews_link.text.strip()
-                else:
-                    reviews_el = soup.find(string=lambda x: x and 'review' in x.lower() and x.parent.name not in ['script', 'style'])
-                    if reviews_el:
-                        data['reviews_count'] = reviews_el.parent.text.strip()
-
-            # Categories
-            category_links = soup.find_all('a', href=lambda x: x and '/categories/' in x)
-            categories = []
-            for link in category_links:
-                cat_name = link.text.strip()
-                if cat_name and cat_name not in categories:
-                    categories.append(cat_name)
-            
-            if categories:
-                data['categories'] = ', '.join(categories[:5])
-            
-            return data
-            
         except Exception as e:
-            return {
-                'url': url,
-                'error': f"Playwright Error: {str(e)}"
-            }
+            print(f"Error scraping {url}: {e}")
+            data['error'] = str(e)
         finally:
-            browser.close()
+            page.close()
+            
+        return data
 
-# For module compatibility
+    def _parse_content(self, soup, data):
+        """Helper to parse HTML/JSON-LD content."""
+        # 1. Try JSON-LD first
+        json_ld = soup.find('script', type='application/ld+json')
+        if json_ld:
+            try:
+                data_json = json.loads(json_ld.string)
+                target_item = None
+                
+                if isinstance(data_json, list):
+                    for item in data_json:
+                        if item.get('@type') in ['Product', 'WebApplication', ['WebApplication', 'Product']]:
+                            target_item = item
+                            break
+                elif isinstance(data_json, dict):
+                     target_item = data_json
+
+                if target_item:
+                    self._map_json_ld(target_item, data)
+            except Exception as e:
+                print(f"Error parsing JSON-LD: {e}")
+
+        # 2. Try Apollo State (Robust fallback for Reviews/Other pages)
+        if not data['product_name'] or not data['rating']:
+             self._extract_apollo_state(soup, data)
+
+        # 3. HTML Fallbacks
+        if not data['product_name']:
+            name_el = soup.find('h1')
+            if name_el:
+                data['product_name'] = name_el.text.strip()
+        
+        if not data['website_url']:
+            website_link = soup.find('a', {'data-test': 'visit-website-button'})
+            if website_link:
+                data['website_url'] = website_link.get('href', '')
+
+        if not data['tagline']:
+            for tag in ['h2.text-18', 'h2.font-medium', 'h2']:
+                parts = tag.split('.')
+                tag_name = parts[0]
+                cls_name = parts[1] if len(parts) > 1 else None
+                
+                if cls_name:
+                    el = soup.find(tag_name, class_=cls_name)
+                else:
+                    el = soup.find(tag_name)
+                
+                if el:
+                    data['tagline'] = el.text.strip()
+                    break
+
+        if not data['rating']:
+            rating_spans = soup.find_all('span', class_='text-14 font-medium')
+            for span in rating_spans:
+                text = span.text.strip()
+                try:
+                    val = float(text)
+                    if 0 <= val <= 5:
+                        data['rating'] = text
+                        break
+                except ValueError:
+                    continue
+
+        if not data['reviews_count']:
+            reviews_link = soup.find('a', href=lambda x: x and '/reviews' in x)
+            if reviews_link and 'review' in reviews_link.text.lower():
+                data['reviews_count'] = reviews_link.text.strip()
+            else:
+                reviews_el = soup.find(string=lambda x: x and 'review' in x.lower() and x.parent.name not in ['script', 'style'])
+                if reviews_el:
+                    data['reviews_count'] = reviews_el.parent.text.strip()
+
+        # Categories fallback
+        if not data['categories']:
+            category_links = soup.find_all('a', href=lambda x: x and '/categories/' in x)
+            cats = []
+            for link in category_links:
+                c = link.text.strip()
+                if c and c not in cats:
+                    cats.append(c)
+            if cats:
+                data['categories'] = ', '.join(cats[:5])
+    
+    def _map_json_ld(self, item, data):
+        if item.get('name'):
+            data['product_name'] = item['name']
+        
+        if item.get('aggregateRating'):
+            rating_obj = item['aggregateRating']
+            if rating_obj.get('ratingValue'):
+                data['rating'] = str(rating_obj['ratingValue'])
+            if rating_obj.get('ratingCount'):
+                data['reviews_count'] = str(rating_obj['ratingCount'])
+        
+        if item.get('applicationCategory'):
+            data['categories'] = item['applicationCategory']
+
+    def _extract_apollo_state(self, soup, data):
+        """Extracts data from Apollo Client state (usually in scripts)."""
+        try:
+            scripts = soup.find_all('script')
+            apollo_script = None
+            for s in scripts:
+                if s.string and 'ApolloSSRDataTransport' in s.string:
+                    apollo_script = s.string
+                    break
+            
+            if not apollo_script:
+                return
+
+            # Format is usually: (window[Symbol.for("ApolloSSRDataTransport")] ??= []).push({...})
+            start_marker = '.push('
+            end_marker = ')'
+            
+            start_idx = apollo_script.find(start_marker)
+            if start_idx == -1: return
+
+            json_start = start_idx + len(start_marker)
+            json_end = apollo_script.rfind(end_marker)
+            
+            if json_end <= json_start: return
+
+            json_str = apollo_script[json_start:json_end]
+            apollo_data = json.loads(json_str)
+            
+            # Navigate rehydrate -> keys -> structuredData
+            if 'rehydrate' in apollo_data:
+                for key, value in apollo_data['rehydrate'].items():
+                    if 'data' in value and 'product' in value['data']:
+                        prod = value['data']['product']
+                        
+                        # Prioritize structuredData if available
+                        if 'structuredData' in prod:
+                             self._map_json_ld(prod['structuredData'], data)
+                        
+                        # Direct Product Object props
+                        if not data['product_name'] and prod.get('name'):
+                            data['product_name'] = prod['name']
+                        
+                        if not data['tagline'] and prod.get('tagline'):
+                            data['tagline'] = prod['tagline']
+                            
+                        if not data['website_url'] and prod.get('websiteUrl'):
+                            data['website_url'] = prod['websiteUrl']
+                        
+                        if not data['reviews_count'] and prod.get('reviewsCount'):
+                            data['reviews_count'] = str(prod['reviewsCount'])
+
+                        if not data['rating'] and prod.get('reviewsRating'):
+                            data['rating'] = str(prod['reviewsRating'])
+                            
+                        # If found, stop searching keys
+                        if data['product_name']:
+                            break
+
+        except Exception as e:
+            print(f"Error parsing Apollo state: {e}")
+
+# Legacy wrapper for backward compatibility with app.py
 def scrape_producthunt(url):
-    return scrape_producthunt_with_playwright(url)
+    """
+    One-off scraper function. Warning: inefficient for bulk operations
+    as it launches a browser instance for a single URL.
+    """
+    with ProductHuntScraper() as scraper:
+        return scraper.scrape_url(url)
 
 if __name__ == "__main__":
     if not os.path.exists('urls.txt'):
@@ -194,20 +291,30 @@ if __name__ == "__main__":
         print("No URLs found in urls.txt")
         exit(1)
 
+    print(f"Loaded {len(urls)} URLs. Starting high-performance scraper...")
+    
     results = []
-    total = len(urls)
     
-    for i, url in enumerate(urls, 1):
-        print(f"[{i}/{total}] Processing...")
-        result = scrape_producthunt_with_playwright(url)
-        results.append(result)
-        # Playwright isolates sessions well, but a small delay is still polite
-        time.sleep(1) 
-    
+    # Use the context manager to keep browser open across all URLs
+    with ProductHuntScraper(headless=True) as scraper:
+        for i, url in enumerate(urls, 1):
+            print(f"[{i}/{len(urls)}] Processing...")
+            result = scraper.scrape_url(url)
+            results.append(result)
+            # Small delay to be polite, but no browser restart overhead
+            time.sleep(1) 
+
+    # Save to CSV
     try:
         df = pd.DataFrame(results)
-        output_file = 'producthunt_data.csv'
+        # Timestamped filename to avoid overwriting
+        timestamp = time.strftime("%Y-%m-%dT%H-%M")
+        output_file = f'final files/{timestamp}_export.csv'
+        
+        # Ensure directory exists
+        os.makedirs('final files', exist_ok=True)
+        
         df.to_csv(output_file, index=False)
-        print(f"\n✅ Done! Saved {len(results)} results to {output_file}")
+        print(f"\\n✅ Done! Saved {len(results)} results to {output_file}")
     except Exception as e:
         print(f"Error saving CSV: {e}")
