@@ -6,11 +6,49 @@ import os
 import random
 import json
 
+def install_playwright_browser():
+    """
+    Installs Playwright Chromium browser if not already present.
+    Useful for environments like Streamlit Cloud where we can't easily run shell commands pre-startup.
+    """
+    import subprocess
+    print("Checking/Installing Playwright Chromium...")
+    try:
+        subprocess.run(["playwright", "install", "chromium"], check=True)
+        # Also install deps if possible (may fail if no sudo, but worth a shot or relying on packages.txt)
+        # subprocess.run(["playwright", "install-deps", "chromium"], check=True) 
+        print("Playwright installation check complete.")
+    except Exception as e:
+        print(f"Error installing Playwright: {e}")
+
 def scrape_producthunt_with_playwright(url):
     print(f"Scraping: {url}")
     
+    # Ensure browser is installed before first launch
+    # We do this here or could do it at module level, but inside function is safer for imports
+    install_playwright_browser()
+    
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        try:
+            # Try to launch with fallback args for containerized envs
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu' # Often needed in headless linux
+                ]
+            )
+        except Exception as e:
+            # Last ditch effort: try installing and launching again if specifically a missing executable error
+            print(f"Launch failed, retrying after install: {e}")
+            install_playwright_browser()
+            browser = p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            )
+
         # Use a consistent, real user agent
         context = browser.new_context(
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
