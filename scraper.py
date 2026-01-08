@@ -1,33 +1,38 @@
-import cloudscraper
+from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import pandas as pd
 import time
 import os
 import random
+import json
 
-def get_scraper():
-    # extensive browser simulation to bypass Cloudflare
-    return cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'desktop': True
-        }
-    )
-
-def scrape_producthunt(url, retries=3):
+def scrape_producthunt_with_playwright(url):
     print(f"Scraping: {url}")
-    scraper = get_scraper()
     
-    for attempt in range(retries):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        # Use a consistent, real user agent
+        context = browser.new_context(
+            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            viewport={'width': 1920, 'height': 1080}
+        )
+        
+        page = context.new_page()
+        
         try:
-            # Add random delay before request
-            time.sleep(random.uniform(1, 3))
+            # Go to page with extended timeout
+            page.goto(url, timeout=60000, wait_until="domcontentloaded")
             
-            response = scraper.get(url, timeout=30)
-            response.raise_for_status()
+            # Wait for specific element to ensure page loaded (e.g. product name header)
+            # This implicitly waits for Cloudflare to pass
+            try:
+                page.wait_for_selector('h1', timeout=30000)
+            except:
+                print("Timeout waiting for content, page might be blocked or slow.")
             
-            soup = BeautifulSoup(response.content, 'html.parser')
+            # Get the full HTML content after JS execution
+            content = page.content()
+            soup = BeautifulSoup(content, 'html.parser')
             
             data = {
                 'url': url,
@@ -40,7 +45,6 @@ def scrape_producthunt(url, retries=3):
             }
             
             # 1. Try JSON-LD first (Structured Data)
-            import json
             json_ld = soup.find('script', type='application/ld+json')
             if json_ld:
                 try:
@@ -129,14 +133,16 @@ def scrape_producthunt(url, retries=3):
             return data
             
         except Exception as e:
-            print(f"Attempt {attempt+1} failed for {url}: {e}")
-            if attempt < retries - 1:
-                time.sleep(5)  # Backoff before retry
-            else:
-                return {
-                    'url': url,
-                    'error': f"Failed after {retries} attempts: {str(e)}"
-                }
+            return {
+                'url': url,
+                'error': f"Playwright Error: {str(e)}"
+            }
+        finally:
+            browser.close()
+
+# For module compatibility
+def scrape_producthunt(url):
+    return scrape_producthunt_with_playwright(url)
 
 if __name__ == "__main__":
     if not os.path.exists('urls.txt'):
@@ -155,9 +161,10 @@ if __name__ == "__main__":
     
     for i, url in enumerate(urls, 1):
         print(f"[{i}/{total}] Processing...")
-        result = scrape_producthunt(url)
+        result = scrape_producthunt_with_playwright(url)
         results.append(result)
-        time.sleep(random.uniform(2, 5)) 
+        # Playwright isolates sessions well, but a small delay is still polite
+        time.sleep(1) 
     
     try:
         df = pd.DataFrame(results)
