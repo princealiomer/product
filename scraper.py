@@ -215,8 +215,9 @@ class ProductHuntScraper:
             scripts = soup.find_all('script')
             apollo_script = None
             for s in scripts:
-                if s.string and 'ApolloSSRDataTransport' in s.string:
-                    apollo_script = s.string
+                content = s.get_text()
+                if content and 'ApolloSSRDataTransport' in content:
+                    apollo_script = content
                     break
             
             if not apollo_script:
@@ -235,14 +236,41 @@ class ProductHuntScraper:
             if json_end <= json_start: return
 
             json_str = apollo_script[json_start:json_end]
+            
+            # Sanitize JS 'undefined' which refers to missing/null data in Apollo state
+            json_str = json_str.replace('undefined', 'null')
+            
+            # Sanitize potentially unquoted keys if any (though usually Apollo is JSON-like)
+            # But the main issue observed was 'undefined'
+            
             apollo_data = json.loads(json_str)
+            
+            # Extract slug from URL for verification
+            # URL format: .../products/slug OR .../products/slug/reviews
+            # Remove query params
+            clean_url = data['url'].split('?')[0].split('#')[0]
+            parts = clean_url.rstrip('/').split('/')
+            
+            target_slug = None
+            if 'products' in parts:
+                try:
+                    p_index = parts.index('products')
+                    if len(parts) > p_index + 1:
+                        target_slug = parts[p_index + 1]
+                except:
+                    pass
             
             # Navigate rehydrate -> keys -> structuredData
             if 'rehydrate' in apollo_data:
                 for key, value in apollo_data['rehydrate'].items():
-                    if 'data' in value and 'product' in value['data']:
+                    if value and 'data' in value and value['data'] and 'product' in value['data']:
                         prod = value['data']['product']
                         
+                        # VERIFY SLUG matches target (if we could extract one)
+                        # This prevents grabbing "Related Products" or "Alternatives" data
+                        if target_slug and prod.get('slug') and prod.get('slug').lower() != target_slug.lower():
+                            continue
+
                         # Prioritize structuredData if available
                         if 'structuredData' in prod:
                              self._map_json_ld(prod['structuredData'], data)
@@ -263,7 +291,7 @@ class ProductHuntScraper:
                         if not data['rating'] and prod.get('reviewsRating'):
                             data['rating'] = str(prod['reviewsRating'])
                             
-                        # If found, stop searching keys
+                        # If found (and slug matched), stop searching
                         if data['product_name']:
                             break
 
@@ -301,8 +329,10 @@ if __name__ == "__main__":
             print(f"[{i}/{len(urls)}] Processing...")
             result = scraper.scrape_url(url)
             results.append(result)
-            # Small delay to be polite, but no browser restart overhead
-            time.sleep(1) 
+            # Random delay to be polite and avoid spam detection (2-5 seconds)
+            delay = random.uniform(2, 5)
+            print(f"Waiting {delay:.2f}s...")
+            time.sleep(delay)
 
     # Save to CSV
     try:
