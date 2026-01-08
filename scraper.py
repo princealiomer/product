@@ -368,10 +368,11 @@ if __name__ == "__main__":
             print(f"[{i}/{len(urls)}] Processing...")
             result = scraper.scrape_url(url)
             results.append(result)
-            # Random delay to be polite and avoid spam detection (2-5 seconds)
-            delay = random.uniform(2, 5)
-            print(f"Waiting {delay:.2f}s...")
-            time.sleep(delay)
+            # Fixed 25 second delay to avoid any blocking
+            if i < len(urls):  # Don't wait after the last URL
+                delay = 25
+                print(f"Waiting {delay}s...")
+                time.sleep(delay)
 
     # Save to CSV
     try:
