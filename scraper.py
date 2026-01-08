@@ -412,9 +412,9 @@ if __name__ == "__main__":
             print(f"[{i}/{len(urls)}] Processing...")
             result = scraper.scrape_url(url)
             results.append(result)
-            # Fixed 25 second delay to avoid any blocking
+            # Fixed 20 second delay to avoid any blocking
             if i < len(urls):  # Don't wait after the last URL
-                delay = 25
+                delay = 20
                 print(f"Waiting {delay}s...")
                 time.sleep(delay)
 
