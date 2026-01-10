@@ -97,12 +97,26 @@ class ProductHuntScraper:
         
         data = {
             'url': url,
+            'product_id': '',
             'product_name': '',
+            'product_slug': '',
             'website_url': '',
             'tagline': '',
+            'description': '',
             'rating': '',
             'reviews_count': '',
+            'detailed_reviews_count': '',
+            'founder_reviews_count': '',
+            'other_reviews_count': '',
+            'is_no_longer_online': '',
+            'logo_uuid': '',
+            'twitter_url': '',
+            'facebook_url': '',
+            'linkedin_url': '',
+            'instagram_url': '',
             'categories': '',
+            'alternatives': '',
+            'detailed_reviews_data': [], # List to store parsed reviews
             'error': ''
         }
 
@@ -293,7 +307,7 @@ class ProductHuntScraper:
             data['categories'] = item['applicationCategory']
 
     def _extract_apollo_state(self, soup, data):
-        """Extracts data from Apollo Client state (usually in scripts)."""
+        """Extracts detailed data from Apollo Client state."""
         try:
             scripts = soup.find_all('script')
             apollo_script = None
@@ -306,7 +320,7 @@ class ProductHuntScraper:
             if not apollo_script:
                 return
 
-            # Format is usually: (window[Symbol.for("ApolloSSRDataTransport")] ??= []).push({...})
+            # Format: (window[Symbol.for("ApolloSSRDataTransport")] ??= []).push({...})
             start_marker = '.push('
             end_marker = ')'
             
@@ -319,21 +333,13 @@ class ProductHuntScraper:
             if json_end <= json_start: return
 
             json_str = apollo_script[json_start:json_end]
-            
-            # Sanitize JS 'undefined' which refers to missing/null data in Apollo state
             json_str = json_str.replace('undefined', 'null')
-            
-            # Sanitize potentially unquoted keys if any (though usually Apollo is JSON-like)
-            # But the main issue observed was 'undefined'
             
             apollo_data = json.loads(json_str)
             
-            # Extract slug from URL for verification
-            # URL format: .../products/slug OR .../products/slug/reviews
-            # Remove query params
+            # Identify the slug from the URL to map to the correct product object
             clean_url = data['url'].split('?')[0].split('#')[0]
             parts = clean_url.rstrip('/').split('/')
-            
             target_slug = None
             if 'products' in parts:
                 try:
@@ -342,41 +348,126 @@ class ProductHuntScraper:
                         target_slug = parts[p_index + 1]
                 except:
                     pass
-            
-            # Navigate rehydrate -> keys -> structuredData
+
             if 'rehydrate' in apollo_data:
+                # 1. First pass: Find the main product object
+                product_data = None
+                
+                # Check directly in keys that look like queries
                 for key, value in apollo_data['rehydrate'].items():
-                    if value and 'data' in value and value['data'] and 'product' in value['data']:
-                        prod = value['data']['product']
+                    if not value or 'data' not in value or not value['data']:
+                        continue
                         
-                        # VERIFY SLUG matches target (if we could extract one)
-                        # This prevents grabbing "Related Products" or "Alternatives" data
+                    if 'product' in value['data']:
+                        prod = value['data']['product']
+                        if not prod: continue
+                        
+                        # Verify slug match if we have one
                         if target_slug and prod.get('slug') and prod.get('slug').lower() != target_slug.lower():
                             continue
-
-                        # Prioritize structuredData if available
-                        if 'structuredData' in prod:
-                             self._map_json_ld(prod['structuredData'], data)
-                        
-                        # Direct Product Object props
-                        if not data['product_name'] and prod.get('name'):
-                            data['product_name'] = prod['name']
-                        
-                        if not data['tagline'] and prod.get('tagline'):
-                            data['tagline'] = prod['tagline']
                             
-                        if not data['website_url'] and prod.get('websiteUrl'):
-                            data['website_url'] = prod['websiteUrl']
+                        # This is likely our product
+                        product_data = prod
                         
-                        if not data['reviews_count'] and prod.get('reviewsCount'):
-                            data['reviews_count'] = str(prod['reviewsCount'])
+                        # Populate Basic Info
+                        data['product_id'] = prod.get('id')
+                        data['product_name'] = prod.get('name') or data['product_name']
+                        data['product_slug'] = prod.get('slug')
+                        data['tagline'] = prod.get('tagline') or data['tagline']
+                        data['description'] = prod.get('description')
+                        data['website_url'] = prod.get('websiteUrl') or data['website_url']
+                        data['logo_uuid'] = prod.get('logoUuid')
+                        data['is_no_longer_online'] = prod.get('isNoLongerOnline')
+                        
+                        # Populate Metrics
+                        data['rating'] = str(prod.get('reviewsRating', '')) if prod.get('reviewsRating') not in [None, 'null'] else data['rating']
+                        data['reviews_count'] = str(prod.get('reviewsCount', '')) if prod.get('reviewsCount') not in [None, 'null'] else data['reviews_count']
+                        data['detailed_reviews_count'] = prod.get('detailedReviewsCount')
+                        data['founder_reviews_count'] = prod.get('founderDetailedReviewsCount')
+                        data['other_reviews_count'] = prod.get('otherDetailedReviewsCount')
+                        
+                        # Rating Distribution
+                        if prod.get('detailedReviewsRatingSpecificCount'):
+                            for item in prod['detailedReviewsRatingSpecificCount']:
+                                rating_key = f"rating_{item.get('rating')}_star_count"
+                                data[rating_key] = item.get('count')
 
-                        if not data['rating'] and prod.get('reviewsRating'):
-                            data['rating'] = str(prod['reviewsRating'])
+                        # Social Links (if available in this object, sometimes deeply nested)
+                        data['twitter_url'] = prod.get('twitterUrl')
+                        data['facebook_url'] = prod.get('facebookUrl')
+                        data['linkedin_url'] = prod.get('linkedinUrl')
+                        data['instagram_url'] = prod.get('instagramUrl')
+
+                        # Categories
+                        if prod.get('categories'):
+                            cats = [c.get('name') for c in prod['categories'] if c.get('name')]
+                            data['categories'] = ', '.join(cats)
+
+                        # Alternatives
+                        if prod.get('alternatives') and prod['alternatives'].get('edges'):
+                            alts = []
+                            for edge in prod['alternatives']['edges']:
+                                node = edge.get('node')
+                                if node and node.get('product'):
+                                    alts.append(node['product'].get('name'))
+                            data['alternatives'] = ', '.join(alts[:5])
                             
-                        # If found (and slug matched), stop searching
-                        if data['product_name']:
+                        # If we found the main product block, we can stop searching for basic info
+                        if product_data:
                             break
+                            
+                # 2. Extract Reviews
+                # Reviews might be in a separate query key within rehydrate (e.g. DetailedReviewsPage)
+                # We need to collect all reviews found across keys for this product
+                all_reviews = []
+                
+                for key, value in apollo_data['rehydrate'].items():
+                    if not value or 'data' not in value or not value['data']:
+                        continue
+                    
+                    # Look for reviews connection
+                    prod_node = value['data'].get('product')
+                    if prod_node and 'detailedReviews' in prod_node:
+                        dr_connection = prod_node['detailedReviews']
+                        if dr_connection and 'edges' in dr_connection:
+                            for edge in dr_connection['edges']:
+                                node = edge.get('node')
+                                if node:
+                                    all_reviews.append(node)
+                
+                # Deduplicate reviews by ID
+                unique_reviews = {r['id']: r for r in all_reviews}.values()
+                
+                # Process reviews into list of dicts stored in data['detailed_reviews_data']
+                # The main scraper will loop over these to create rows
+                data['detailed_reviews_data'] = []
+                
+                for r in unique_reviews:
+                    user = r.get('user', {})
+                    from_post = r.get('fromPost', {})
+                    from_product = from_post.get('product', {}) if from_post else {}
+
+                    review_entry = {
+                        'review_id': r.get('id'),
+                        'review_type': r.get('reviewType'),
+                        'review_status': r.get('status'),
+                        'review_rating': r.get('overallRating'),
+                        'review_text': r.get('overallExperience'),
+                        'review_created_at': r.get('createdAt'),
+                        
+                        # Reviewer Info
+                        'reviewer_id': user.get('id'),
+                        'reviewer_name': user.get('name'),
+                        'reviewer_username': user.get('username'),
+                        'reviewer_headline': user.get('headline'),
+                        'reviewer_verified': user.get('isAccountVerified'),
+                        
+                        # Source Post Info (if founder review)
+                        'source_post_name': from_post.get('name'),
+                        'source_post_slug': from_post.get('slug'),
+                        'source_product_id': from_product.get('id')
+                    }
+                    data['detailed_reviews_data'].append(review_entry)
 
         except Exception as e:
             print(f"Error parsing Apollo state: {e}")
@@ -407,11 +498,30 @@ if __name__ == "__main__":
     results = []
     
     # Use the context manager to keep browser open across all URLs
+    # Use the context manager to keep browser open across all URLs
     with ProductHuntScraper(headless=True) as scraper:
         for i, url in enumerate(urls, 1):
             print(f"[{i}/{len(urls)}] Processing...")
             result = scraper.scrape_url(url)
-            results.append(result)
+            
+            # If we have detailed reviews, creating multiple rows (one per review)
+            if result.get('detailed_reviews_data'):
+                reviews = result.pop('detailed_reviews_data')
+                
+                # Base product data (removed the list to avoid duplication)
+                base_data = result.copy()
+                
+                for review in reviews:
+                    # Combine base product data with review data
+                    row = base_data.copy()
+                    row.update(review)
+                    results.append(row)
+            else:
+                # No detailed reviews found, just append the product data
+                # Remove the list key if it exists empty
+                result.pop('detailed_reviews_data', None)
+                results.append(result)
+
             # Fixed 20 second delay to avoid any blocking
             if i < len(urls):  # Don't wait after the last URL
                 delay = 20
@@ -420,7 +530,9 @@ if __name__ == "__main__":
 
     # Save to CSV
     try:
+        # Normalize keys across all results (some might have review data, some not)
         df = pd.DataFrame(results)
+        
         # Timestamped filename to avoid overwriting
         timestamp = time.strftime("%Y-%m-%dT%H-%M")
         output_file = f'final files/{timestamp}_export.csv'
@@ -429,6 +541,6 @@ if __name__ == "__main__":
         os.makedirs('final files', exist_ok=True)
         
         df.to_csv(output_file, index=False)
-        print(f"\\n✅ Done! Saved {len(results)} results to {output_file}")
+        print(f"\\n✅ Done! Saved {len(results)} rows to {output_file}")
     except Exception as e:
         print(f"Error saving CSV: {e}")
